@@ -14,6 +14,7 @@ import math
 import os
 import base64
 import numpy as np
+import threading
 from typing import Dict, List, Optional, Any, Callable
 from dataclasses import dataclass, field
 
@@ -238,6 +239,7 @@ class RoomHost:
         # STL data storage
         self.stl_data: Optional[STLData] = None
         self.stl_broadcast_enabled = False
+        self.stl_thread: Optional[threading.Thread] = None
         
         print(f"🎯 Room Host Initialized:")
         print(f"   Scene ID: {self.scene_id}")
@@ -290,6 +292,15 @@ class RoomHost:
             self.socket.close()
             self.socket = None
             print("🔌 Disconnected from server")
+        
+        # Stop STL broadcast thread if running
+        if self.stl_thread and self.stl_thread.is_alive():
+            print("🔄 Stopping STL broadcast thread...")
+            self.stl_thread.join(timeout=2.0)  # Wait up to 2 seconds
+            if self.stl_thread.is_alive():
+                print("⚠️ STL broadcast thread did not stop gracefully")
+            else:
+                print("✅ STL broadcast thread stopped")
     
     def send_server_message(self, message_type: str, args: Dict[str, Any]):
         """Send a message to the server"""
@@ -408,15 +419,9 @@ class RoomHost:
         try:
             data = message.data
             
-            # Handle binary messages (non-JSON)
+            # Silently skip binary messages (real-time transform data from Unity)
             if isinstance(data, bytes):
-                # Try to identify what kind of binary message this is
-                hex_preview = data[:16].hex() if len(data) >= 16 else data.hex()
-                print(f"📥 Received binary message ({len(data)} bytes) from {message.network_id}")
-                print(f"   Preview: {hex_preview}...")
-                # For now, we'll just acknowledge binary messages but not process them
-                # These are typically peer-to-peer connection requests from Unity
-                return
+                return  # Skip immediately without any processing or logging
             
             # Handle JSON messages
             if not isinstance(data, dict):
@@ -702,10 +707,54 @@ class RoomHost:
                 
                 print(f"🔊 Broadcasting test message #{self.broadcast_counter} to {len(self.peers)-1} peers")
                 self.broadcast_to_peers("HostBroadcast", broadcast_data)
+    
+    async def stl_broadcast_loop(self):
+        """Dedicated STL broadcasting loop that runs independently"""
+        print("📐 STL broadcast thread started")
+        
+        while self.running and self.socket:
+            await asyncio.sleep(15)  # Broadcast STL every 15 seconds
+            
+            # Only broadcast if STL is enabled, data is loaded, and there are peers
+            if (self.stl_broadcast_enabled and 
+                self.stl_data and 
+                len(self.peers) > 1):
                 
-                # Also broadcast STL data if enabled
-                if self.stl_broadcast_enabled and self.stl_data:
+                try:
+                    print(f"📐 Broadcasting STL data ({self.stl_data.filename}) to {len(self.peers)-1} peers")
                     self.broadcast_stl_data()
+                except Exception as e:
+                    print(f"❌ Error in STL broadcast: {e}")
+            
+            # If no peers, just wait quietly
+            elif len(self.peers) <= 1:
+                # Don't spam messages when no peers are connected
+                pass
+            elif not self.stl_broadcast_enabled or not self.stl_data:
+                # STL not ready, wait quietly
+                pass
+    
+    def stl_broadcast_thread_func(self):
+        """Real threading function for STL broadcasting - runs independently of asyncio"""
+        print("📐 STL broadcast thread started (real thread)")
+        
+        while self.running:
+            time.sleep(15)  # Broadcast STL every 15 seconds (blocking sleep in thread)
+            
+            # Only broadcast if STL is enabled, data is loaded, and there are peers
+            if (self.running and 
+                self.socket and
+                self.stl_broadcast_enabled and 
+                self.stl_data and 
+                len(self.peers) > 1):
+                
+                try:
+                    print(f"📐 [Thread] Broadcasting STL data ({self.stl_data.filename}) to {len(self.peers)-1} peers")
+                    self.broadcast_stl_data()
+                except Exception as e:
+                    print(f"❌ [Thread] Error in STL broadcast: {e}")
+        
+        print("📐 STL broadcast thread stopped")
     
     def get_peer_count(self) -> int:
         """Get the number of peers (excluding self)"""
@@ -793,6 +842,11 @@ class RoomHost:
         self.stl_broadcast_enabled = enabled
         if enabled and self.stl_data:
             print(f"🔊 STL broadcasting enabled for {self.stl_data.filename}")
+            # Start the STL broadcast thread if not already running
+            if not self.stl_thread or not self.stl_thread.is_alive():
+                self.stl_thread = threading.Thread(target=self.stl_broadcast_thread_func, daemon=True)
+                self.stl_thread.start()
+                print("🚀 STL broadcast thread started")
         elif enabled:
             print("⚠️ STL broadcasting enabled but no STL data loaded")
         else:
@@ -872,6 +926,7 @@ async def main():
         # Start message processing loop
         message_task = asyncio.create_task(host.message_loop())
         broadcast_task = asyncio.create_task(host.broadcast_loop())
+        # Note: STL broadcasting now uses real threading, started automatically when enabled
         
         try:
             # Discover and join/create room
@@ -901,8 +956,7 @@ async def main():
                 
                 print(f"\n🎮 Room Host is running...")
                 print("💬 Broadcasting messages to peers every 10 seconds")
-                if host.stl_broadcast_enabled:
-                    print("📐 Broadcasting STL mesh data to peers every 10 seconds")
+                print("📐 STL broadcasting using real threading every 15 seconds")
                 print("🏓 Sending keep-alive pings every 5 seconds")
                 print("🔄 Press Ctrl+C to stop")
                 
@@ -940,7 +994,7 @@ async def main():
         except Exception as e:
             print(f"❌ Error: {e}")
         finally:
-            host.disconnect()
+            host.disconnect()  # This will also stop the STL thread
             message_task.cancel()
             broadcast_task.cancel()
             try:
